@@ -1,9 +1,20 @@
+#!/usr/bin/env python3
+"""
+Discord bot – generador y verificador de disponibilidad (solo GET).
+Usa el endpoint /users/@me/username?username= con el token de usuario.
+NO reclama nombres, solo verifica.
+Incluye logs detallados para depuración.
+Variables de entorno:
+  DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
+"""
+
 import os
 import asyncio
 import aiohttp
 import random
 import string
 import io
+import json
 from typing import List
 
 import discord
@@ -25,7 +36,9 @@ USER_HEADERS = {
 }
 API_BASE = "https://discord.com/api/v9"
 
-
+# ------------------------------------------------------------------
+#  GENERADORES
+# ------------------------------------------------------------------
 
 def gen_numbers(count: int, length: int) -> List[str]:
     return [''.join(random.choices(string.digits, k=length)) for _ in range(count)]
@@ -42,27 +55,41 @@ def gen_words(count: int, wordlist: List[str]) -> List[str]:
 def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
-
+# ------------------------------------------------------------------
+#  VERIFICADOR (SOLO GET, CON LOGS)
+# ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
     Consulta el endpoint de disponibilidad.
     Retorna True si el nombre está disponible, False en caso contrario.
+    Imprime en consola la respuesta completa para depuración.
     """
     url = f"{API_BASE}/users/@me/username?username={username}"
     try:
         async with session.get(url, headers=USER_HEADERS) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("available", False)
-            elif resp.status == 429:
+            status = resp.status
+            text = await resp.text()
+            print(f"[CHECK] {username} -> status {status}, response: {text[:200]}")
+            
+            if status == 200:
+                data = json.loads(text)
+                available = data.get("available", False)
+                print(f"  -> available = {available}")
+                return available
+            elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
+                print(f"  -> rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
-                return await check_username_available(session, username) 
-            else:
-                
+                return await check_username_available(session, username)  # reintentar
+            elif status in (401, 403):
+                print(f"  -> ERROR DE AUTENTICACIÓN: verifica el token de usuario")
                 return False
-    except Exception:
+            else:
+                print(f"  -> error no manejado (status {status})")
+                return False
+    except Exception as e:
+        print(f"  -> EXCEPCIÓN: {e}")
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
@@ -71,14 +98,17 @@ async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List
     """
     available = []
     async with aiohttp.ClientSession() as session:
+        total = len(usernames)
         for idx, name in enumerate(usernames, start=1):
-            print(f"[{idx}/{len(usernames)}] Verificando: {name}")
+            print(f"[{idx}/{total}] Verificando: {name}")
             if await check_username_available(session, name):
                 available.append(name)
             await asyncio.sleep(delay)
     return available
 
-
+# ------------------------------------------------------------------
+#  BOT
+# ------------------------------------------------------------------
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -89,7 +119,9 @@ async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
 
-
+# ------------------------------------------------------------------
+#  ENVÍO DE REPORTE (SOLO DISPONIBLES)
+# ------------------------------------------------------------------
 
 async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
     if not channel.permissions_for(channel.guild.me).send_messages:
@@ -108,7 +140,7 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
     embed = discord.Embed(
         title=f"✅ Nombres disponibles – {generator_name}",
-        description=f"Se encontraron {len(available)} nombres disponibles (no reclamados).",
+        description=f"Se encontraron {len(available)} nombres disponibles.",
         color=discord.Color.green()
     )
     preview = "\n".join(available[:10])
@@ -117,13 +149,15 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     embed.add_field(name="Vista previa", value=f"```\n{preview}```", inline=False)
     await channel.send(embed=embed, file=file)
 
+# ------------------------------------------------------------------
+#  COMANDOS SLASH (siempre verifican, sin opción de reclamar)
+# ------------------------------------------------------------------
 
-
-@bot.tree.command(name="numbers", description="Genera nombres numéricos y verifica disponibilidad")
+@bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
 @app_commands.describe(
     count="Cantidad (máx 50)",
     length="Longitud del número (1-10)",
-    channel="Canal para enviar el reporte (opcional)"
+    channel="Canal para el reporte (opcional)"
 )
 async def slash_numbers(interaction: discord.Interaction, count: int, length: int,
                         channel: discord.TextChannel = None):
@@ -142,7 +176,7 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-@bot.tree.command(name="alnum", description="Genera nombres alfanuméricos y verifica")
+@bot.tree.command(name="alnum", description="Genera alfanuméricos y verifica")
 @app_commands.describe(
     count="Cantidad (máx 50)",
     length="Longitud (3-12)",
@@ -165,7 +199,7 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-@bot.tree.command(name="words", description="Genera palabras desde un archivo .txt y verifica")
+@bot.tree.command(name="words", description="Genera palabras desde archivo y verifica")
 @app_commands.describe(
     file="Archivo .txt con una palabra por línea",
     count="Cantidad (máx 50)",
@@ -203,7 +237,7 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
 @app_commands.describe(
     prefix="Prefijo alfanumérico (sin espacios)",
     count="Cantidad (máx 50)",
-    num_len="Número de dígitos después del prefijo (1-6)",
+    num_len="Número de dígitos (1-6)",
     channel="Canal para el reporte"
 )
 async def slash_pattern(interaction: discord.Interaction, prefix: str, count: int,
@@ -226,12 +260,14 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-
+# ------------------------------------------------------------------
+#  SERVIDOR WEB PARA RAILWAY
+# ------------------------------------------------------------------
 
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – solo verifica disponibilidad")
+    return web.Response(text="Bot activo – solo verifica disponibilidad (logs en consola)")
 
 async def start_web_server():
     app = web.Application()
@@ -242,7 +278,9 @@ async def start_web_server():
     await site.start()
     print("Servidor web iniciado en puerto 8080")
 
-
+# ------------------------------------------------------------------
+#  EJECUCIÓN PRINCIPAL
+# ------------------------------------------------------------------
 
 async def main():
     asyncio.create_task(start_web_server())
