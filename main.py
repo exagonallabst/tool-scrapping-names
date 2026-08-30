@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Discord bot – generador y verificador de disponibilidad (solo GET).
-Usa el endpoint /users/@me/username?username= con el token de usuario.
-NO reclama nombres, solo verifica.
-Incluye logs detallados para depuración.
-Variables de entorno:
-  DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
+Discord bot – generador y verificador de disponibilidad con diagnóstico.
+Verifica token de usuario al inicio.
+Si no hay disponibles, muestra una muestra de las respuestas de la API.
+Desplegable en Railway.
+Variables de entorno: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
 """
 
 import os
@@ -15,7 +14,7 @@ import random
 import string
 import io
 import json
-from typing import List
+from typing import List, Tuple
 
 import discord
 from discord import app_commands
@@ -56,55 +55,69 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR (SOLO GET, CON LOGS)
+#  VERIFICADOR CON RESPUESTA DETALLADA
 # ------------------------------------------------------------------
 
-async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
+async def check_username_with_details(session: aiohttp.ClientSession, username: str) -> Tuple[bool, int, str]:
     """
-    Consulta el endpoint de disponibilidad.
-    Retorna True si el nombre está disponible, False en caso contrario.
-    Imprime en consola la respuesta completa para depuración.
+    Retorna (disponible, status_code, texto_respuesta)
     """
     url = f"{API_BASE}/users/@me/username?username={username}"
     try:
         async with session.get(url, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
-            print(f"[CHECK] {username} -> status {status}, response: {text[:200]}")
-            
             if status == 200:
                 data = json.loads(text)
                 available = data.get("available", False)
-                print(f"  -> available = {available}")
-                return available
+                return available, status, text
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
-                print(f"  -> rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
-                return await check_username_available(session, username)  # reintentar
-            elif status in (401, 403):
-                print(f"  -> ERROR DE AUTENTICACIÓN: verifica el token de usuario")
-                return False
+                return await check_username_with_details(session, username)
             else:
-                print(f"  -> error no manejado (status {status})")
-                return False
+                return False, status, text
     except Exception as e:
-        print(f"  -> EXCEPCIÓN: {e}")
-        return False
+        return False, 0, str(e)
 
-async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
+async def check_list_with_details(usernames: List[str], delay: float = REQUEST_DELAY) -> Tuple[List[str], List[dict]]:
     """
-    Retorna SOLO los nombres que están disponibles (según GET).
+    Retorna (lista_disponibles, lista_detalles_para_depuración)
+    detalles: lista de dicts con 'username', 'available', 'status', 'response'
     """
     available = []
+    details = []
     async with aiohttp.ClientSession() as session:
         total = len(usernames)
         for idx, name in enumerate(usernames, start=1):
             print(f"[{idx}/{total}] Verificando: {name}")
-            if await check_username_available(session, name):
+            ok, status, text = await check_username_with_details(session, name)
+            details.append({"username": name, "available": ok, "status": status, "response": text[:200]})
+            if ok:
                 available.append(name)
             await asyncio.sleep(delay)
-    return available
+    return available, details
+
+# ------------------------------------------------------------------
+#  VERIFICACIÓN DEL TOKEN DE USUARIO AL INICIAR
+# ------------------------------------------------------------------
+
+async def validate_user_token():
+    """Verifica que el token de usuario funcione con una llamada a /users/@me."""
+    async with aiohttp.ClientSession() as session:
+        url = f"{API_BASE}/users/@me"
+        try:
+            async with session.get(url, headers=USER_HEADERS) as resp:
+                if resp.status == 200:
+                    print("TOKEN DE USUARIO VÁLIDO")
+                    return True
+                else:
+                    text = await resp.text()
+                    print(f"TOKEN DE USUARIO INVÁLIDO (status {resp.status}): {text[:200]}")
+                    return False
+        except Exception as e:
+            print(f"ERROR AL VALIDAR TOKEN: {e}")
+            return False
 
 # ------------------------------------------------------------------
 #  BOT
@@ -118,12 +131,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
+    # Validar token de usuario
+    if not await validate_user_token():
+        print("⚠️  EL TOKEN DE USUARIO NO ES VÁLIDO. LAS VERIFICACIONES FALLARÁN.")
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE (SOLO DISPONIBLES)
+#  ENVÍO DE REPORTE CON OPCIÓN DE MUESTRA DE DEBUG
 # ------------------------------------------------------------------
 
-async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
+async def send_available_only(channel: discord.TextChannel, available: List[str],
+                              generator_name: str, details: List[dict] = None):
     if not channel.permissions_for(channel.guild.me).send_messages:
         print(f"Sin permisos para enviar a {channel.name}")
         return
@@ -133,6 +150,20 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
             description="No se encontraron nombres disponibles.",
             color=discord.Color.red()
         )
+        # Agregar muestra de respuestas de la API para depuración
+        if details:
+            sample = details[:5]  # primeros 5
+            debug_text = ""
+            for d in sample:
+                status = d["status"]
+                resp = d["response"][:100].replace("\n", " ")
+                debug_text += f"`{d['username']}` → status {status}: {resp}\n"
+            embed.add_field(
+                name="🔍 Muestra de respuestas de la API (primeros 5)",
+                value=debug_text[:1000] or "Sin datos",
+                inline=False
+            )
+            embed.set_footer(text="Si ves status 401/403, el token de usuario es inválido.")
         await channel.send(embed=embed)
         return
 
@@ -150,7 +181,7 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     await channel.send(embed=embed, file=file)
 
 # ------------------------------------------------------------------
-#  COMANDOS SLASH (siempre verifican, sin opción de reclamar)
+#  COMANDOS SLASH
 # ------------------------------------------------------------------
 
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
@@ -170,9 +201,9 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando disponibilidad... (puede tardar)")
-    available = await check_list(names)
+    available, details = await check_list_with_details(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "numbers")
+    await send_available_only(target, available, "numbers", details)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -193,9 +224,9 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available = await check_list(names)
+    available, details = await check_list_with_details(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "alnum")
+    await send_available_only(target, available, "alnum", details)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -227,9 +258,9 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available = await check_list(names)
+    available, details = await check_list_with_details(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "words")
+    await send_available_only(target, available, "words", details)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -254,9 +285,9 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available = await check_list(names)
+    available, details = await check_list_with_details(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "pattern")
+    await send_available_only(target, available, "pattern", details)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -267,7 +298,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – solo verifica disponibilidad (logs en consola)")
+    return web.Response(text="Bot activo – verifica disponibilidad con debug")
 
 async def start_web_server():
     app = web.Application()
