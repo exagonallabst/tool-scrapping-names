@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificación de disponibilidad con doble estrategia.
-Primero intenta GET /users/@me/username?username= (funciona con token de usuario).
-Si da 404, fallback a PATCH con reversión.
-Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
+Discord bot – verificación de disponibilidad por existencia de usuario.
+Endpoint: GET /api/v9/users/username?username=...
+- 404 → nombre libre (disponible)
+- 200 → nombre ocupado
+- 429 → rate limit, espera y reintenta
+- Otros → se considera no disponible (por seguridad)
+Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
 """
 
 import os
@@ -54,113 +57,50 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON GET Y FALLBACK PATCH
+#  VERIFICADOR POR EXISTENCIA (GET /users/username)
 # ------------------------------------------------------------------
 
-async def get_current_username(session: aiohttp.ClientSession) -> Optional[str]:
-    url = f"{API_BASE}/users/@me"
-    try:
-        async with session.get(url, headers=USER_HEADERS) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("username")
-            else:
-                print(f"Error al obtener username actual: {resp.status}")
-                return None
-    except Exception as e:
-        print(f"Excepción: {e}")
-        return None
-
-async def check_via_get(session: aiohttp.ClientSession, username: str) -> Optional[bool]:
+async def check_username_exists(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Intenta GET /users/@me/username?username=...
-    Retorna True si disponible, False si no, None si error (para fallback)
+    Retorna True si el nombre está disponible (no existe usuario con ese nombre).
+    Usa GET /users/username?username=... 
+    - 404 → libre
+    - 200 → ocupado
+    - 429 → reintentar
+    - otro → asumir ocupado (por seguridad)
     """
-    url = f"{API_BASE}/users/@me/username?username={username}"
+    url = f"{API_BASE}/users/username?username={username}"
     try:
         async with session.get(url, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
             print(f"  GET {username} → status {status}, respuesta: {text[:150]}")
-            if status == 200:
-                data = json.loads(text)
-                return data.get("available", False)
+            if status == 404:
+                return True   # no existe, disponible
+            elif status == 200:
+                return False  # existe, ocupado
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
+                print(f"  rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
-                return await check_via_get(session, username)
+                return await check_username_exists(session, username)
             else:
-                # 404, 401, 403, 500... no confiamos en GET, usamos fallback
-                return None
-    except Exception as e:
-        print(f"  GET excepción: {e}")
-        return None
-
-async def check_via_patch(session: aiohttp.ClientSession, candidate: str, original: str) -> bool:
-    """
-    Intenta PATCH con reversión. Retorna True si disponible y revertido.
-    """
-    patch_url = f"{API_BASE}/users/@me"
-    payload = {"username": candidate}
-    try:
-        async with session.patch(patch_url, headers=USER_HEADERS, json=payload) as resp:
-            status = resp.status
-            text = await resp.text()
-            print(f"  PATCH {candidate} → status {status}, respuesta: {text[:150]}")
-            if status == 200:
-                # Revertir
-                revert = {"username": original}
-                async with session.patch(patch_url, headers=USER_HEADERS, json=revert) as rev:
-                    if rev.status == 200:
-                        print(f"  → revertido exitosamente")
-                    else:
-                        print(f"  → falló reversión (status {rev.status})")
-                return True
-            elif status == 400:
-                if "taken" in text.lower() or "unavailable" in text.lower():
-                    return False
-                else:
-                    # Otro error, p.ej. longitud
-                    return False
-            elif status == 429:
-                retry = (await resp.json()).get("retry_after", 5)
-                await asyncio.sleep(retry + 1)
-                return await check_via_patch(session, candidate, original)
-            else:
-                # 401, 403, etc. -> fallo
+                # 401, 403, 500, etc. -> asumir ocupado
                 return False
     except Exception as e:
-        print(f"  PATCH excepción: {e}")
+        print(f"  GET excepción: {e}")
         return False
 
-async def check_username(session: aiohttp.ClientSession, username: str, original: str) -> bool:
-    """
-    Estrategia: primero GET, si devuelve None (error) usar PATCH.
-    """
-    result_get = await check_via_get(session, username)
-    if result_get is not None:
-        return result_get
-    else:
-        # Fallback a PATCH
-        print(f"  GET falló, usando PATCH fallback para {username}")
-        return await check_via_patch(session, username, original)
-
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
+    available = []
     async with aiohttp.ClientSession() as session:
-        original = await get_current_username(session)
-        if not original:
-            print("ERROR: No se pudo obtener el nombre actual. Verifica el token.")
-            return []
-        print(f"Nombre actual: {original}")
-
-        available = []
         total = len(usernames)
         for idx, name in enumerate(usernames, start=1):
             print(f"[{idx}/{total}] Verificando: {name}")
-            if await check_username(session, name, original):
+            if await check_username_exists(session, name):
                 available.append(name)
             await asyncio.sleep(delay)
-        return available
+    return available
 
 # ------------------------------------------------------------------
 #  BOT
@@ -174,15 +114,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Verificar token de usuario
+    # Verificar token de usuario con GET /users/@me
     async with aiohttp.ClientSession() as session:
-        if await get_current_username(session):
-            print("✅ TOKEN DE USUARIO VÁLIDO")
-        else:
-            print("❌ TOKEN DE USUARIO INVÁLIDO – las verificaciones fallarán.")
+        url = f"{API_BASE}/users/@me"
+        try:
+            async with session.get(url, headers=USER_HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
+                else:
+                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status})")
+        except Exception as e:
+            print(f"❌ Error al validar token: {e}")
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE
+#  ENVÍO DE REPORTE (SOLO DISPONIBLES)
 # ------------------------------------------------------------------
 
 async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
@@ -202,7 +148,7 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
     embed = discord.Embed(
         title=f"✅ Nombres disponibles – {generator_name}",
-        description=f"Se encontraron {len(available)} nombres disponibles (ver archivo).",
+        description=f"Se encontraron {len(available)} nombres disponibles (ver archivo adjunto).",
         color=discord.Color.green()
     )
     preview = "\n".join(available[:10])
@@ -218,13 +164,13 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
 @app_commands.describe(
     count="Cantidad (máx 50)",
-    length="Longitud del número (1-10)",
+    length="Longitud del número (2-10)",
     channel="Canal para el reporte (opcional)"
 )
 async def slash_numbers(interaction: discord.Interaction, count: int, length: int,
                         channel: discord.TextChannel = None):
     if count > 50: count = 50
-    if length < 2: length = 2          # Discord mínimo 2 caracteres
+    if length < 2: length = 2
     if length > 10: length = 10
     names = gen_numbers(count, length)
     await interaction.response.send_message(
@@ -329,7 +275,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verifica disponibilidad (GET + fallback PATCH)")
+    return web.Response(text="Bot activo – verifica disponibilidad por existencia de usuario")
 
 async def start_web_server():
     app = web.Application()
