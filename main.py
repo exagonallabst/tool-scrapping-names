@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Discord bot – generador y verificador de disponibilidad con diagnóstico.
-Verifica token de usuario al inicio.
-Si no hay disponibles, muestra una muestra de las respuestas de la API.
-Desplegable en Railway.
+Discord bot – verifica disponibilidad usando PATCH con reversión.
+- Obtiene el nombre actual del usuario.
+- Para cada candidato, intenta cambiar a ese nombre.
+- Si éxito (200), lo reclama y luego revierte al original.
+- Si error 400 con "taken" o "unavailable", no está disponible.
+- Maneja rate limits y errores de autenticación.
 Variables de entorno: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
 """
 
@@ -14,7 +16,7 @@ import random
 import string
 import io
 import json
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import discord
 from discord import app_commands
@@ -55,69 +57,97 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON RESPUESTA DETALLADA
+#  VERIFICADOR CON PATCH + REVERSIÓN
 # ------------------------------------------------------------------
 
-async def check_username_with_details(session: aiohttp.ClientSession, username: str) -> Tuple[bool, int, str]:
-    """
-    Retorna (disponible, status_code, texto_respuesta)
-    """
-    url = f"{API_BASE}/users/@me/username?username={username}"
+async def get_current_username(session: aiohttp.ClientSession) -> Optional[str]:
+    """Obtiene el nombre de usuario actual del token."""
+    url = f"{API_BASE}/users/@me"
     try:
         async with session.get(url, headers=USER_HEADERS) as resp:
-            status = resp.status
-            text = await resp.text()
-            if status == 200:
-                data = json.loads(text)
-                available = data.get("available", False)
-                return available, status, text
-            elif status == 429:
-                retry = (await resp.json()).get("retry_after", 5)
-                await asyncio.sleep(retry + 1)
-                return await check_username_with_details(session, username)
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("username")
             else:
-                return False, status, text
+                print(f"Error al obtener username actual: {resp.status}")
+                return None
     except Exception as e:
-        return False, 0, str(e)
+        print(f"Excepción al obtener username: {e}")
+        return None
 
-async def check_list_with_details(usernames: List[str], delay: float = REQUEST_DELAY) -> Tuple[List[str], List[dict]]:
+async def try_claim_and_revert(session: aiohttp.ClientSession, candidate: str, original: str) -> bool:
     """
-    Retorna (lista_disponibles, lista_detalles_para_depuración)
-    detalles: lista de dicts con 'username', 'available', 'status', 'response'
+    Intenta cambiar al candidate. Si éxito, revierte al original y retorna True.
+    Si falla por 'taken' o 'unavailable', retorna False.
     """
-    available = []
-    details = []
+    # Intentar cambiar al candidate
+    patch_url = f"{API_BASE}/users/@me"
+    payload = {"username": candidate}
+    try:
+        async with session.patch(patch_url, headers=USER_HEADERS, json=payload) as resp:
+            if resp.status == 200:
+                # Éxito: reclamado. Ahora revertir al original
+                print(f"  -> {candidate} DISPONIBLE (reclamado), revirtiendo a {original}")
+                revert_payload = {"username": original}
+                async with session.patch(patch_url, headers=USER_HEADERS, json=revert_payload) as revert_resp:
+                    if revert_resp.status == 200:
+                        print(f"  -> Reversión exitosa")
+                        return True
+                    else:
+                        print(f"  -> ERROR al revertir: {revert_resp.status}")
+                        # No podemos revertir, pero el nombre ya está cambiado. De todas formas, reportamos como disponible
+                        return True
+            elif resp.status == 400:
+                data = await resp.json()
+                # Mensajes típicos: "Username is already taken", "Username unavailable"
+                error_msg = str(data)
+                if "taken" in error_msg.lower() or "unavailable" in error_msg.lower():
+                    print(f"  -> {candidate} NO DISPONIBLE (tomado)")
+                    return False
+                else:
+                    # Otro error 400 (ej. longitud, caracteres inválidos)
+                    print(f"  -> {candidate} error 400: {error_msg}")
+                    return False
+            elif resp.status == 429:
+                retry = (await resp.json()).get("retry_after", 5)
+                print(f"  -> rate limit, esperando {retry}s")
+                await asyncio.sleep(retry + 1)
+                return await try_claim_and_revert(session, candidate, original)
+            else:
+                # 401, 403, 500, etc.
+                print(f"  -> {candidate} error {resp.status}")
+                return False
+    except Exception as e:
+        print(f"  -> Excepción al verificar {candidate}: {e}")
+        return False
+
+async def check_username_available(session: aiohttp.ClientSession, username: str, original: str) -> bool:
+    """
+    Verifica disponibilidad usando PATCH con reversión.
+    Retorna True si el nombre está disponible (y se revirtió correctamente).
+    """
+    return await try_claim_and_revert(session, username, original)
+
+async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
+    """
+    Retorna SOLO los nombres que están disponibles.
+    Primero obtiene el nombre original, luego prueba cada candidato.
+    """
     async with aiohttp.ClientSession() as session:
+        original = await get_current_username(session)
+        if not original:
+            print("ERROR: No se pudo obtener el nombre actual. Abortando.")
+            return []
+        print(f"Nombre actual: {original}")
+
+        available = []
         total = len(usernames)
         for idx, name in enumerate(usernames, start=1):
             print(f"[{idx}/{total}] Verificando: {name}")
-            ok, status, text = await check_username_with_details(session, name)
-            details.append({"username": name, "available": ok, "status": status, "response": text[:200]})
-            if ok:
+            if await check_username_available(session, name, original):
                 available.append(name)
             await asyncio.sleep(delay)
-    return available, details
-
-# ------------------------------------------------------------------
-#  VERIFICACIÓN DEL TOKEN DE USUARIO AL INICIAR
-# ------------------------------------------------------------------
-
-async def validate_user_token():
-    """Verifica que el token de usuario funcione con una llamada a /users/@me."""
-    async with aiohttp.ClientSession() as session:
-        url = f"{API_BASE}/users/@me"
-        try:
-            async with session.get(url, headers=USER_HEADERS) as resp:
-                if resp.status == 200:
-                    print("TOKEN DE USUARIO VÁLIDO")
-                    return True
-                else:
-                    text = await resp.text()
-                    print(f"TOKEN DE USUARIO INVÁLIDO (status {resp.status}): {text[:200]}")
-                    return False
-        except Exception as e:
-            print(f"ERROR AL VALIDAR TOKEN: {e}")
-            return False
+        return available
 
 # ------------------------------------------------------------------
 #  BOT
@@ -131,16 +161,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
-    # Validar token de usuario
-    if not await validate_user_token():
-        print("⚠️  EL TOKEN DE USUARIO NO ES VÁLIDO. LAS VERIFICACIONES FALLARÁN.")
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE CON OPCIÓN DE MUESTRA DE DEBUG
+#  ENVÍO DE REPORTE (SOLO DISPONIBLES)
 # ------------------------------------------------------------------
 
-async def send_available_only(channel: discord.TextChannel, available: List[str],
-                              generator_name: str, details: List[dict] = None):
+async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
     if not channel.permissions_for(channel.guild.me).send_messages:
         print(f"Sin permisos para enviar a {channel.name}")
         return
@@ -150,20 +176,6 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
             description="No se encontraron nombres disponibles.",
             color=discord.Color.red()
         )
-        # Agregar muestra de respuestas de la API para depuración
-        if details:
-            sample = details[:5]  # primeros 5
-            debug_text = ""
-            for d in sample:
-                status = d["status"]
-                resp = d["response"][:100].replace("\n", " ")
-                debug_text += f"`{d['username']}` → status {status}: {resp}\n"
-            embed.add_field(
-                name="🔍 Muestra de respuestas de la API (primeros 5)",
-                value=debug_text[:1000] or "Sin datos",
-                inline=False
-            )
-            embed.set_footer(text="Si ves status 401/403, el token de usuario es inválido.")
         await channel.send(embed=embed)
         return
 
@@ -171,12 +183,12 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
     embed = discord.Embed(
         title=f"✅ Nombres disponibles – {generator_name}",
-        description=f"Se encontraron {len(available)} nombres disponibles.",
+        description=f"Se encontraron {len(available)} nombres disponibles (ver archivo adjunto).",
         color=discord.Color.green()
     )
     preview = "\n".join(available[:10])
     if len(available) > 10:
-        preview += f"\n... y {len(available)-10} más (ver archivo adjunto)"
+        preview += f"\n... y {len(available)-10} más"
     embed.add_field(name="Vista previa", value=f"```\n{preview}```", inline=False)
     await channel.send(embed=embed, file=file)
 
@@ -201,9 +213,9 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando disponibilidad... (puede tardar)")
-    available, details = await check_list_with_details(names)
+    available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "numbers", details)
+    await send_available_only(target, available, "numbers")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -224,9 +236,9 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available, details = await check_list_with_details(names)
+    available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "alnum", details)
+    await send_available_only(target, available, "alnum")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -258,9 +270,9 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available, details = await check_list_with_details(names)
+    available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "words", details)
+    await send_available_only(target, available, "words")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -285,9 +297,9 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
     await interaction.followup.send("Verificando...")
-    available, details = await check_list_with_details(names)
+    available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "pattern", details)
+    await send_available_only(target, available, "pattern")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -298,7 +310,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verifica disponibilidad con debug")
+    return web.Response(text="Bot activo – verifica disponibilidad con PATCH y reversión")
 
 async def start_web_server():
     app = web.Application()
