@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-
+# ===== CONFIGURACIÓN =====
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
@@ -44,47 +44,36 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
 
 
 
-async def check_username(session: aiohttp.ClientSession, username: str) -> bool:
+async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Verifica disponibilidad con GET /users/@me/username?username=...
-    Si está disponible, reclama con PATCH /users/@me.
-    Retorna True solo si el PATCH fue exitoso.
+    Consulta el endpoint de disponibilidad.
+    Retorna True si el nombre está disponible, False en caso contrario.
     """
-  
-    check_url = f"{API_BASE}/users/@me/username?username={username}"
+    url = f"{API_BASE}/users/@me/username?username={username}"
     try:
-        async with session.get(check_url, headers=USER_HEADERS) as resp:
+        async with session.get(url, headers=USER_HEADERS) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if not data.get("available", False):
-                    return False
-                
-                patch_url = f"{API_BASE}/users/@me"
-                async with session.patch(patch_url, headers=USER_HEADERS, json={"username": username}) as patch_resp:
-                    if patch_resp.status == 200:
-                        return True
-                    else:
-                        
-                        return False
+                return data.get("available", False)
             elif resp.status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 await asyncio.sleep(retry + 1)
-                return await check_username(session, username)
+                return await check_username_available(session, username) 
             else:
-            
+                
                 return False
     except Exception:
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
     """
-    Retorna SOLO los nombres que fueron reclamados exitosamente.
+    Retorna SOLO los nombres que están disponibles (según GET).
     """
     available = []
     async with aiohttp.ClientSession() as session:
         for idx, name in enumerate(usernames, start=1):
-            print(f"[{idx}/{len(usernames)}] Checking {name}")
-            if await check_username(session, name):
+            print(f"[{idx}/{len(usernames)}] Verificando: {name}")
+            if await check_username_available(session, name):
                 available.append(name)
             await asyncio.sleep(delay)
     return available
@@ -119,7 +108,7 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
     embed = discord.Embed(
         title=f"✅ Nombres disponibles – {generator_name}",
-        description=f"Se reclamaron {len(available)} nombres.",
+        description=f"Se encontraron {len(available)} nombres disponibles (no reclamados).",
         color=discord.Color.green()
     )
     preview = "\n".join(available[:10])
@@ -130,15 +119,14 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
 
 
 
-@bot.tree.command(name="numbers", description="Genera nombres numéricos")
+@bot.tree.command(name="numbers", description="Genera nombres numéricos y verifica disponibilidad")
 @app_commands.describe(
     count="Cantidad (máx 50)",
     length="Longitud del número (1-10)",
-    check="Verificar y reclamar si está disponible",
-    channel="Canal para enviar el reporte (solo disponibles)"
+    channel="Canal para enviar el reporte (opcional)"
 )
 async def slash_numbers(interaction: discord.Interaction, count: int, length: int,
-                        check: bool = False, channel: discord.TextChannel = None):
+                        channel: discord.TextChannel = None):
     if count > 50: count = 50
     if length < 1: length = 1
     if length > 10: length = 10
@@ -147,26 +135,21 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
         f"Generados {len(names)} números:\n" + "\n".join(names[:20]) +
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
-    if check:
-        await interaction.followup.send("Verificando disponibilidad... (puede tardar)")
-        available = await check_list(names)
-        target = channel or interaction.channel
-        await send_available_only(target, available, "numbers")
-        if target != interaction.channel:
-            await interaction.followup.send(f"Reporte enviado a {target.mention}")
-    else:
-        if channel:
-            await interaction.followup.send("El canal se ignora porque check=False. Usa check=True.")
+    await interaction.followup.send("Verificando disponibilidad... (puede tardar)")
+    available = await check_list(names)
+    target = channel or interaction.channel
+    await send_available_only(target, available, "numbers")
+    if target != interaction.channel:
+        await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-@bot.tree.command(name="alnum", description="Genera nombres alfanuméricos")
+@bot.tree.command(name="alnum", description="Genera nombres alfanuméricos y verifica")
 @app_commands.describe(
     count="Cantidad (máx 50)",
     length="Longitud (3-12)",
-    check="Verificar y reclamar",
     channel="Canal para el reporte"
 )
 async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
-                      check: bool = False, channel: discord.TextChannel = None):
+                      channel: discord.TextChannel = None):
     if count > 50: count = 50
     if length < 3: length = 3
     if length > 12: length = 12
@@ -175,26 +158,21 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
         f"Generados {len(names)} alfanuméricos:\n" + "\n".join(names[:20]) +
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
-    if check:
-        await interaction.followup.send("Verificando...")
-        available = await check_list(names)
-        target = channel or interaction.channel
-        await send_available_only(target, available, "alnum")
-        if target != interaction.channel:
-            await interaction.followup.send(f"Reporte enviado a {target.mention}")
-    else:
-        if channel:
-            await interaction.followup.send("check=False, ignoro el canal.")
+    await interaction.followup.send("Verificando...")
+    available = await check_list(names)
+    target = channel or interaction.channel
+    await send_available_only(target, available, "alnum")
+    if target != interaction.channel:
+        await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-@bot.tree.command(name="words", description="Genera palabras desde un archivo .txt")
+@bot.tree.command(name="words", description="Genera palabras desde un archivo .txt y verifica")
 @app_commands.describe(
     file="Archivo .txt con una palabra por línea",
     count="Cantidad (máx 50)",
-    check="Verificar y reclamar",
     channel="Canal para el reporte"
 )
 async def slash_words(interaction: discord.Interaction, file: discord.Attachment,
-                      count: int, check: bool = False, channel: discord.TextChannel = None):
+                      count: int, channel: discord.TextChannel = None):
     if count > 50: count = 50
     if not file.filename.endswith(".txt"):
         await interaction.response.send_message("El archivo debe ser .txt")
@@ -214,27 +192,22 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
         f"Generadas {len(names)} palabras:\n" + "\n".join(names[:20]) +
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
-    if check:
-        await interaction.followup.send("Verificando...")
-        available = await check_list(names)
-        target = channel or interaction.channel
-        await send_available_only(target, available, "words")
-        if target != interaction.channel:
-            await interaction.followup.send(f"Reporte enviado a {target.mention}")
-    else:
-        if channel:
-            await interaction.followup.send("check=False, ignoro el canal.")
+    await interaction.followup.send("Verificando...")
+    available = await check_list(names)
+    target = channel or interaction.channel
+    await send_available_only(target, available, "words")
+    if target != interaction.channel:
+        await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
-@bot.tree.command(name="pattern", description="Prefijo fijo + dígitos aleatorios")
+@bot.tree.command(name="pattern", description="Prefijo + dígitos y verifica")
 @app_commands.describe(
     prefix="Prefijo alfanumérico (sin espacios)",
     count="Cantidad (máx 50)",
     num_len="Número de dígitos después del prefijo (1-6)",
-    check="Verificar y reclamar",
     channel="Canal para el reporte"
 )
 async def slash_pattern(interaction: discord.Interaction, prefix: str, count: int,
-                        num_len: int, check: bool = False, channel: discord.TextChannel = None):
+                        num_len: int, channel: discord.TextChannel = None):
     if count > 50: count = 50
     if num_len < 1: num_len = 1
     if num_len > 6: num_len = 6
@@ -246,23 +219,19 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
         f"Generados {len(names)} patrones:\n" + "\n".join(names[:20]) +
         (f"\n... y {len(names)-20} más" if len(names) > 20 else "")
     )
-    if check:
-        await interaction.followup.send("Verificando...")
-        available = await check_list(names)
-        target = channel or interaction.channel
-        await send_available_only(target, available, "pattern")
-        if target != interaction.channel:
-            await interaction.followup.send(f"Reporte enviado a {target.mention}")
-    else:
-        if channel:
-            await interaction.followup.send("check=False, ignoro el canal.")
+    await interaction.followup.send("Verificando...")
+    available = await check_list(names)
+    target = channel or interaction.channel
+    await send_available_only(target, available, "pattern")
+    if target != interaction.channel:
+        await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
 
 
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo")
+    return web.Response(text="Bot activo – solo verifica disponibilidad")
 
 async def start_web_server():
     app = web.Application()
