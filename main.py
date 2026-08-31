@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificador de disponibilidad con endpoint oficial.
-Comandos: /numbers, /alnum, /words, /pattern, /check.
-Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
+Discord bot – verificación de disponibilidad de nombres de usuario.
+Usa el endpoint público /users/username?username=... (sin autenticación).
+- 404 → nombre libre (disponible)
+- 200 → nombre ocupado (existe)
+- 429 → rate limit (espera y reintenta)
+- Otros → se considera ocupado por seguridad
+Variables: DISCORD_BOT_TOKEN (obligatorio), REQUEST_DELAY (opcional)
+El token de usuario solo se usa para validación inicial, no es necesario para la verificación.
 """
 
 import os
@@ -13,7 +18,7 @@ import string
 import io
 import json
 import re
-from typing import List, Optional
+from typing import List
 
 import discord
 from discord import app_commands
@@ -21,15 +26,13 @@ from discord.ext import commands
 
 # ===== CONFIGURACIÓN =====
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
 
-if not DISCORD_BOT_TOKEN or not DISCORD_USER_TOKEN:
-    raise RuntimeError("Faltan variables de entorno DISCORD_BOT_TOKEN o DISCORD_USER_TOKEN.")
+if not DISCORD_BOT_TOKEN:
+    raise RuntimeError("Falta la variable de entorno DISCORD_BOT_TOKEN.")
 
-USER_HEADERS = {
-    "Authorization": DISCORD_USER_TOKEN,
-    "Content-Type": "application/json",
+# Headers para el endpoint público (no necesita autenticación)
+PUBLIC_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 API_BASE = "https://discord.com/api/v9"
@@ -54,25 +57,26 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON ENDPOINT /users/@me/username
+#  VERIFICADOR CON ENDPOINT PÚBLICO
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Usa el endpoint oficial que usa la interfaz web de Discord.
-    Retorna True si available=True, False en cualquier otro caso.
+    Usa GET /users/username?username=... (público).
+    Retorna True si el nombre está disponible (404), False si ocupado (200) o error.
     """
-    url = f"{API_BASE}/users/@me/username?username={username}"
+    url = f"{API_BASE}/users/username?username={username}"
     try:
-        async with session.get(url, headers=USER_HEADERS) as resp:
+        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
             print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
-            if status == 200:
-                data = json.loads(text)
-                available = data.get("available", False)
-                print(f"  → {'✅ DISPONIBLE' if available else '❌ OCUPADO'}")
-                return available
+            if status == 404:
+                print(f"  → ✅ DISPONIBLE (no existe)")
+                return True
+            elif status == 200:
+                print(f"  → ❌ OCUPADO (existe)")
+                return False
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  ⏳ rate limit, esperando {retry}s")
@@ -114,24 +118,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    async with aiohttp.ClientSession() as session:
-        url = f"{API_BASE}/users/@me"
-        try:
-            async with session.get(url, headers=USER_HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
-                else:
-                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status})")
-        except Exception as e:
-            print(f"❌ Error al validar token: {e}")
+    # Solo informativo: no necesita token de usuario para verificar.
+    print("✅ Usando endpoint público, no se requiere token de usuario.")
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE CON MUESTRA DE DEBUG
+#  ENVÍO DE REPORTE
 # ------------------------------------------------------------------
 
-async def send_available_only(channel: discord.TextChannel, available: List[str],
-                              generator_name: str, sample_responses: List[str] = None):
+async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
     if not channel.permissions_for(channel.guild.me).send_messages:
         print(f"Sin permisos para enviar a {channel.name}")
         return
@@ -141,13 +135,6 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
             description="No se encontraron nombres disponibles.",
             color=discord.Color.red()
         )
-        if sample_responses:
-            muestra = "\n".join(sample_responses[:3])
-            embed.add_field(
-                name="🔍 Ejemplo de respuestas de la API",
-                value=f"```\n{muestra}```",
-                inline=False
-            )
         await channel.send(embed=embed)
         return
 
@@ -187,9 +174,7 @@ async def slash_check(interaction: discord.Interaction, lista: str, channel: dis
 
     available = await check_list(names)
     target = channel or interaction.channel
-    # Para depuración, guardamos algunas respuestas de ejemplo (las que se imprimen en logs, pero no tenemos acceso aquí)
-    # Podemos pasar una lista vacía; el embed no mostrará muestra.
-    await send_available_only(target, available, "check", None)
+    await send_available_only(target, available, "check")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -216,7 +201,7 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
     await interaction.followup.send("Verificando disponibilidad...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "numbers", None)
+    await send_available_only(target, available, "numbers")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -239,7 +224,7 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "alnum", None)
+    await send_available_only(target, available, "alnum")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -273,7 +258,7 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "words", None)
+    await send_available_only(target, available, "words")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -300,7 +285,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "pattern", None)
+    await send_available_only(target, available, "pattern")
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -311,7 +296,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador con endpoint oficial")
+    return web.Response(text="Bot activo – verificador de disponibilidad (endpoint público)")
 
 async def start_web_server():
     app = web.Application()
