@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificador de disponibilidad definitivo.
-Endpoint prioritario: /users/@me/username (autenticado).
-Fallback a /users/username (público) si el primero falla por 401/403.
-Comandos: /check, /test, /numbers, /alnum, /words, /pattern.
-Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
+Discord bot – verificador de disponibilidad con endpoint público.
+Solo usa GET /users/username?username=... 
+- 404 → nombre libre (disponible)
+- 200 → nombre ocupado (existe)
+- 429 → rate limit, reintenta
+- otros → ocupado por seguridad
+Variables: DISCORD_BOT_TOKEN (obligatorio), REQUEST_DELAY (opcional)
+NO necesita DISCORD_USER_TOKEN.
 """
 
 import os
@@ -23,17 +26,12 @@ from discord.ext import commands
 
 # ===== CONFIGURACIÓN =====
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
 
-if not DISCORD_BOT_TOKEN or not DISCORD_USER_TOKEN:
-    raise RuntimeError("Faltan DISCORD_BOT_TOKEN y DISCORD_USER_TOKEN.")
+if not DISCORD_BOT_TOKEN:
+    raise RuntimeError("Falta DISCORD_BOT_TOKEN en variables de entorno.")
 
-USER_HEADERS = {
-    "Authorization": DISCORD_USER_TOKEN,
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-}
+PUBLIC_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 API_BASE = "https://discord.com/api/v9"
 
 # ------------------------------------------------------------------
@@ -56,74 +54,36 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON ENDPOINT AUTENTICADO Y FALLBACK
+#  VERIFICADOR PÚBLICO (CORRECTO)
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Intenta primero el endpoint autenticado /users/@me/username.
-    Si da 401/403, usa fallback público /users/username.
-    Retorna True si disponible (404 en público, o available=true en autenticado).
+    Usa GET /users/username?username=... (público).
+    Retorna True si el nombre está disponible (404), False si ocupado (200) o error.
     """
-    # 1. Endpoint autenticado
-    url_auth = f"{API_BASE}/users/@me/username?username={username}"
+    url = f"{API_BASE}/users/username?username={username}"
     try:
-        async with session.get(url_auth, headers=USER_HEADERS) as resp:
+        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
-            print(f"  [AUTH] GET {username} → status {status}, respuesta: {text[:200]}")
-            if status == 200:
-                data = json.loads(text)
-                available = data.get("available", False)
-                if available:
-                    print(f"  → ✅ DISPONIBLE (autenticado)")
-                else:
-                    print(f"  → ❌ OCUPADO (autenticado)")
-                return available
+            print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
+            if status == 404:
+                print(f"  → ✅ DISPONIBLE (no existe usuario)")
+                return True
+            elif status == 200:
+                print(f"  → ❌ OCUPADO (existe usuario)")
+                return False
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  ⏳ rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_available(session, username)
-            elif status in (401, 403):
-                print(f"  ⚠️ Token inválido o sin permisos, usando fallback público...")
-                # Fallback público
-                return await check_username_public(session, username)
             else:
-                # Otros errores: 400, 500, etc.
                 print(f"  → ❌ ERROR (status {status}), tratado como ocupado")
                 return False
     except Exception as e:
-        print(f"  → ❌ EXCEPCIÓN en autenticado: {e}")
-        return False
-
-async def check_username_public(session: aiohttp.ClientSession, username: str) -> bool:
-    """
-    Fallback público: GET /users/username?username=...
-    404 = disponible, 200 = ocupado.
-    """
-    url_pub = f"{API_BASE}/users/username?username={username}"
-    try:
-        async with session.get(url_pub, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            status = resp.status
-            text = await resp.text()
-            print(f"  [PUBLIC] GET {username} → status {status}, respuesta: {text[:200]}")
-            if status == 404:
-                print(f"  → ✅ DISPONIBLE (público: no existe)")
-                return True
-            elif status == 200:
-                print(f"  → ❌ OCUPADO (público: existe)")
-                return False
-            elif status == 429:
-                retry = (await resp.json()).get("retry_after", 5)
-                print(f"  ⏳ rate limit público, esperando {retry}s")
-                await asyncio.sleep(retry + 1)
-                return await check_username_public(session, username)
-            else:
-                print(f"  → ❌ ERROR público (status {status}), tratado como ocupado")
-                return False
-    except Exception as e:
-        print(f"  → ❌ EXCEPCIÓN en público: {e}")
+        print(f"  → ❌ EXCEPCIÓN: {e}")
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
@@ -155,18 +115,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Validar token
-    async with aiohttp.ClientSession() as session:
-        url = f"{API_BASE}/users/@me"
-        try:
-            async with session.get(url, headers=USER_HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
-                else:
-                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status}), se usará fallback público")
-        except Exception as e:
-            print(f"❌ Error al validar token: {e}")
+    print("✅ Usando endpoint público /users/username (404 = disponible)")
 
 # ------------------------------------------------------------------
 #  ENVÍO DE REPORTE
@@ -202,30 +151,25 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
 #  COMANDO /test (depuración)
 # ------------------------------------------------------------------
 
-@bot.tree.command(name="test", description="Prueba un nombre y muestra la respuesta cruda")
+@bot.tree.command(name="test", description="Prueba un nombre y muestra la respuesta cruda de la API pública")
 @app_commands.describe(username="Nombre a verificar")
 async def slash_test(interaction: discord.Interaction, username: str):
     username = username.strip()
     if len(username) < 2 or len(username) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', username):
-        await interaction.response.send_message("❌ Nombre inválido.")
+        await interaction.response.send_message("❌ Nombre inválido: debe tener 2-32 caracteres alfanuméricos o guión bajo.")
         return
+    url = f"{API_BASE}/users/username?username={username}"
     async with aiohttp.ClientSession() as session:
-        # Probar autenticado
-        url_auth = f"{API_BASE}/users/@me/username?username={username}"
-        async with session.get(url_auth, headers=USER_HEADERS) as resp:
-            text_auth = await resp.text()
-            status_auth = resp.status
-        # Probar público
-        url_pub = f"{API_BASE}/users/username?username={username}"
-        async with session.get(url_pub, headers={"User-Agent": "Mozilla/5.0"}) as resp2:
-            text_pub = await resp2.text()
-            status_pub = resp2.status
-        await interaction.response.send_message(
-            f"**{username}**\n"
-            f"Autenticado: status {status_auth}, respuesta: {text_auth[:200]}\n"
-            f"Público: status {status_pub}, respuesta: {text_pub[:200]}\n\n"
-            f"Interpretación: disponible si autenticado dice 'available':true o público 404."
-        )
+        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
+            status = resp.status
+            text = await resp.text()
+            disponible = (status == 404)
+            await interaction.response.send_message(
+                f"**{username}**\n"
+                f"Status: {status}\n"
+                f"Respuesta: {text[:300]}\n\n"
+                f"Interpretación: {'✅ DISPONIBLE' if disponible else '❌ OCUPADO o error'}"
+            )
 
 # ------------------------------------------------------------------
 #  COMANDO /check
@@ -255,7 +199,7 @@ async def slash_check(interaction: discord.Interaction, lista: str, channel: dis
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
 # ------------------------------------------------------------------
-#  COMANDOS GENERADORES (numbers, alnum, words, pattern)
+#  COMANDOS GENERADORES
 # ------------------------------------------------------------------
 
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
@@ -372,7 +316,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador con doble estrategia")
+    return web.Response(text="Bot activo – verificador público (404 = disponible)")
 
 async def start_web_server():
     app = web.Application()
