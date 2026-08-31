@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificador de disponibilidad con webhook para reportes.
-Usa GET /users/username?username=... (público).
-- 404 → disponible
-- 200 → ocupado
+Discord bot – verificador de disponibilidad con endpoint autenticado.
+Usa GET /users/@me/username?username=... con token de usuario.
+- 200 + "available":true → disponible
+- 200 + "available":false → ocupado
+- 400, 401, 403, 404, 500 → ocupado (por seguridad)
 - 429 → reintentar
-Los reportes se envían mediante webhook para mejorar la presentación.
-Variables: DISCORD_BOT_TOKEN (obligatorio), REQUEST_DELAY (opcional)
+Los reportes se envían mediante webhook (o fallback a mensaje normal).
+Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN (obligatorios), REQUEST_DELAY (opcional)
 """
 
 import os
@@ -17,7 +18,7 @@ import string
 import io
 import json
 import re
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 import discord
 from discord import app_commands
@@ -25,16 +26,21 @@ from discord.ext import commands
 
 # ===== CONFIGURACIÓN =====
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
 
-if not DISCORD_BOT_TOKEN:
-    raise RuntimeError("Falta DISCORD_BOT_TOKEN en variables de entorno.")
+if not DISCORD_BOT_TOKEN or not DISCORD_USER_TOKEN:
+    raise RuntimeError("Faltan DISCORD_BOT_TOKEN y DISCORD_USER_TOKEN.")
 
-PUBLIC_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+USER_HEADERS = {
+    "Authorization": DISCORD_USER_TOKEN,
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
 API_BASE = "https://discord.com/api/v9"
 
-# Cache de webhooks por canal (para reutilizar)
-webhook_cache: Dict[int, discord.Webhook] = {}
+# Cache de webhooks por canal
+webhook_cache = {}
 
 # ------------------------------------------------------------------
 #  GENERADORES
@@ -56,28 +62,35 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR PÚBLICO
+#  VERIFICADOR AUTENTICADO (ÚNICO)
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
-    url = f"{API_BASE}/users/username?username={username}"
+    """
+    Usa GET /users/@me/username?username=... con token de usuario.
+    Retorna True si available=true, False en cualquier otro caso.
+    """
+    url = f"{API_BASE}/users/@me/username?username={username}"
     try:
-        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
+        async with session.get(url, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
             print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
-            if status == 404:
-                print(f"  → ✅ DISPONIBLE")
-                return True
-            elif status == 200:
-                print(f"  → ❌ OCUPADO")
-                return False
+            if status == 200:
+                data = json.loads(text)
+                available = data.get("available", False)
+                if available:
+                    print(f"  → ✅ DISPONIBLE")
+                else:
+                    print(f"  → ❌ OCUPADO")
+                return available
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  ⏳ rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_available(session, username)
             else:
+                # 400, 401, 403, 404, 500, etc. -> ocupado
                 print(f"  → ❌ ERROR (status {status}), tratado como ocupado")
                 return False
     except Exception as e:
@@ -93,7 +106,7 @@ async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List
             if not name:
                 continue
             if len(name) < 2 or len(name) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', name):
-                print(f"  {name} → nombre inválido")
+                print(f"  {name} → nombre inválido (longitud o caracteres)")
                 continue
             print(f"[{idx}/{total}] Verificando: {name}")
             if await check_username_available(session, name):
@@ -106,19 +119,14 @@ async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List
 # ------------------------------------------------------------------
 
 async def get_or_create_webhook(channel: discord.TextChannel) -> Optional[discord.Webhook]:
-    """Obtiene un webhook existente en el canal o crea uno nuevo."""
     channel_id = channel.id
     if channel_id in webhook_cache:
         try:
-            # Verificar que el webhook aún existe
             webhook = webhook_cache[channel_id]
             await webhook.fetch()
             return webhook
         except:
-            # Si falla, eliminar de caché y recrear
             del webhook_cache[channel_id]
-
-    # Buscar webhooks existentes con el nombre deseado
     try:
         webhooks = await channel.webhooks()
         for wh in webhooks:
@@ -127,64 +135,52 @@ async def get_or_create_webhook(channel: discord.TextChannel) -> Optional[discor
                 return wh
     except:
         pass
-
-    # Crear nuevo webhook
     try:
         webhook = await channel.create_webhook(name="Verificador de Nombres")
         webhook_cache[channel_id] = webhook
         return webhook
     except Exception as e:
-        print(f"Error al crear webhook en {channel.name}: {e}")
+        print(f"Error al crear webhook: {e}")
         return None
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE MEDIANTE WEBHOOK
+#  ENVÍO DE REPORTE
 # ------------------------------------------------------------------
 
 async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
-    """Envía el reporte usando un webhook en el canal."""
     webhook = await get_or_create_webhook(channel)
-    if not webhook:
+    if not webhook or not channel.permissions_for(channel.guild.me).send_messages:
         # Fallback a mensaje normal del bot
-        print(f"Webhook no disponible, usando mensaje normal en {channel.name}")
-        if not channel.permissions_for(channel.guild.me).send_messages:
-            print(f"Sin permisos para enviar a {channel.name}")
-            return
         if not available:
-            embed = discord.Embed(
-                title=f"Verificación – {generator_name}",
-                description="No se encontraron nombres disponibles.",
-                color=discord.Color.red()
-            )
+            embed = discord.Embed(title=f"Verificación – {generator_name}",
+                                  description="No se encontraron nombres disponibles.",
+                                  color=discord.Color.red())
             await channel.send(embed=embed)
             return
         file_data = "\n".join(available)
         file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
-        embed = discord.Embed(
-            title=f"✅ Nombres disponibles – {generator_name}",
-            description=f"Se encontraron {len(available)} nombres disponibles.",
-            color=discord.Color.green()
-        )
+        embed = discord.Embed(title=f"✅ Nombres disponibles – {generator_name}",
+                              description=f"Se encontraron {len(available)} nombres disponibles.",
+                              color=discord.Color.green())
+        preview = "\n".join(available[:10])
+        if len(available) > 10:
+            preview += f"\n... y {len(available)-10} más"
+        embed.add_field(name="Vista previa", value=f"```\n{preview}```", inline=False)
         await channel.send(embed=embed, file=file)
         return
 
-    # Enviar mediante webhook
     if not available:
-        embed = discord.Embed(
-            title=f"Verificación – {generator_name}",
-            description="No se encontraron nombres disponibles.",
-            color=discord.Color.red()
-        )
+        embed = discord.Embed(title=f"Verificación – {generator_name}",
+                              description="No se encontraron nombres disponibles.",
+                              color=discord.Color.red())
         await webhook.send(embed=embed, username="Verificador de Nombres")
         return
 
     file_data = "\n".join(available)
     file = discord.File(io.StringIO(file_data), filename=f"available_{generator_name}.txt")
-    embed = discord.Embed(
-        title=f"✅ Nombres disponibles – {generator_name}",
-        description=f"Se encontraron {len(available)} nombres disponibles (ver archivo adjunto).",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title=f"✅ Nombres disponibles – {generator_name}",
+                          description=f"Se encontraron {len(available)} nombres disponibles (ver archivo adjunto).",
+                          color=discord.Color.green())
     preview = "\n".join(available[:10])
     if len(available) > 10:
         preview += f"\n... y {len(available)-10} más"
@@ -203,26 +199,39 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    print("✅ Usando endpoint público /users/username (404 = disponible)")
-    print("✅ Los reportes se enviarán mediante webhook 'Verificador de Nombres'")
+    # Validar token de usuario
+    async with aiohttp.ClientSession() as session:
+        url = f"{API_BASE}/users/@me"
+        try:
+            async with session.get(url, headers=USER_HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
+                else:
+                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status})")
+        except Exception as e:
+            print(f"❌ Error al validar token: {e}")
 
 # ------------------------------------------------------------------
-#  COMANDO /test (depuración)
+#  COMANDO /test
 # ------------------------------------------------------------------
 
-@bot.tree.command(name="test", description="Prueba un nombre y muestra la respuesta cruda de la API pública")
+@bot.tree.command(name="test", description="Prueba un nombre con el endpoint autenticado")
 @app_commands.describe(username="Nombre a verificar")
 async def slash_test(interaction: discord.Interaction, username: str):
     username = username.strip()
     if len(username) < 2 or len(username) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', username):
         await interaction.response.send_message("❌ Nombre inválido.")
         return
-    url = f"{API_BASE}/users/username?username={username}"
+    url = f"{API_BASE}/users/@me/username?username={username}"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
+        async with session.get(url, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
-            disponible = (status == 404)
+            disponible = False
+            if status == 200:
+                data = json.loads(text)
+                disponible = data.get("available", False)
             await interaction.response.send_message(
                 f"**{username}**\n"
                 f"Status: {status}\n"
@@ -258,7 +267,7 @@ async def slash_check(interaction: discord.Interaction, lista: str, channel: dis
         await interaction.followup.send(f"Reporte enviado a {target.mention} mediante webhook.")
 
 # ------------------------------------------------------------------
-#  COMANDOS GENERADORES (numbers, alnum, words, pattern)
+#  COMANDOS GENERADORES
 # ------------------------------------------------------------------
 
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
@@ -375,7 +384,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador con webhook")
+    return web.Response(text="Bot activo – verificador con token de usuario (endpoint correcto)")
 
 async def start_web_server():
     app = web.Application()
