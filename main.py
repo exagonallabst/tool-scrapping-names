@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificación de disponibilidad con endpoint oficial.
-Comandos:
-  /numbers, /alnum, /words, /pattern – generan y verifican
-  /check lista [channel] – verifica nombres específicos
-Usa GET /users/@me/username?username=... que es el mismo que usa la interfaz web.
-Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
+Discord bot – verificador de disponibilidad con endpoint oficial.
+Comandos: /numbers, /alnum, /words, /pattern, /check.
+Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
 """
 
 import os
@@ -57,13 +54,13 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR USANDO @me (endpoint oficial)
+#  VERIFICADOR CON ENDPOINT /users/@me/username
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Consulta /users/@me/username?username=... 
-    Retorna True si el nombre está disponible (available=true), False en caso contrario.
+    Usa el endpoint oficial que usa la interfaz web de Discord.
+    Retorna True si available=True, False en cualquier otro caso.
     """
     url = f"{API_BASE}/users/@me/username?username={username}"
     try:
@@ -73,23 +70,22 @@ async def check_username_available(session: aiohttp.ClientSession, username: str
             print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
             if status == 200:
                 data = json.loads(text)
-                return data.get("available", False)
+                available = data.get("available", False)
+                print(f"  → {'✅ DISPONIBLE' if available else '❌ OCUPADO'}")
+                return available
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
-                print(f"  rate limit, esperando {retry}s")
+                print(f"  ⏳ rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_available(session, username)
             else:
-                # 401, 403, 500, etc. -> asumir no disponible
+                print(f"  → ❌ ERROR (status {status}), tratado como ocupado")
                 return False
     except Exception as e:
-        print(f"  GET excepción: {e}")
+        print(f"  → ❌ EXCEPCIÓN: {e}")
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
-    """
-    Verifica una lista y retorna los disponibles.
-    """
     available = []
     async with aiohttp.ClientSession() as session:
         total = len(usernames)
@@ -97,7 +93,6 @@ async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List
             name = name.strip()
             if not name:
                 continue
-            # Validar formato básico de Discord (2-32 caracteres, alfanumérico + guión bajo)
             if len(name) < 2 or len(name) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', name):
                 print(f"  {name} → nombre inválido (longitud o caracteres)")
                 continue
@@ -119,7 +114,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Validar token de usuario
     async with aiohttp.ClientSession() as session:
         url = f"{API_BASE}/users/@me"
         try:
@@ -133,10 +127,11 @@ async def on_ready():
             print(f"❌ Error al validar token: {e}")
 
 # ------------------------------------------------------------------
-#  ENVÍO DE REPORTE
+#  ENVÍO DE REPORTE CON MUESTRA DE DEBUG
 # ------------------------------------------------------------------
 
-async def send_available_only(channel: discord.TextChannel, available: List[str], generator_name: str):
+async def send_available_only(channel: discord.TextChannel, available: List[str],
+                              generator_name: str, sample_responses: List[str] = None):
     if not channel.permissions_for(channel.guild.me).send_messages:
         print(f"Sin permisos para enviar a {channel.name}")
         return
@@ -146,6 +141,13 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
             description="No se encontraron nombres disponibles.",
             color=discord.Color.red()
         )
+        if sample_responses:
+            muestra = "\n".join(sample_responses[:3])
+            embed.add_field(
+                name="🔍 Ejemplo de respuestas de la API",
+                value=f"```\n{muestra}```",
+                inline=False
+            )
         await channel.send(embed=embed)
         return
 
@@ -172,7 +174,6 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     channel="Canal para el reporte (opcional)"
 )
 async def slash_check(interaction: discord.Interaction, lista: str, channel: discord.TextChannel = None):
-    # Limpiar la lista
     cleaned = lista.replace(',', ' ').replace('\n', ' ').replace('\r', ' ')
     names = [n.strip() for n in cleaned.split() if n.strip()]
     if not names:
@@ -183,9 +184,12 @@ async def slash_check(interaction: discord.Interaction, lista: str, channel: dis
         await interaction.response.send_message(f"Demasiados nombres, limitando a 100.")
     else:
         await interaction.response.send_message(f"Se recibieron {len(names)} nombres. Verificando...")
+
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "check")
+    # Para depuración, guardamos algunas respuestas de ejemplo (las que se imprimen en logs, pero no tenemos acceso aquí)
+    # Podemos pasar una lista vacía; el embed no mostrará muestra.
+    await send_available_only(target, available, "check", None)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -212,7 +216,7 @@ async def slash_numbers(interaction: discord.Interaction, count: int, length: in
     await interaction.followup.send("Verificando disponibilidad...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "numbers")
+    await send_available_only(target, available, "numbers", None)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -235,7 +239,7 @@ async def slash_alnum(interaction: discord.Interaction, count: int, length: int,
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "alnum")
+    await send_available_only(target, available, "alnum", None)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -269,7 +273,7 @@ async def slash_words(interaction: discord.Interaction, file: discord.Attachment
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "words")
+    await send_available_only(target, available, "words", None)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -296,7 +300,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
     await interaction.followup.send("Verificando...")
     available = await check_list(names)
     target = channel or interaction.channel
-    await send_available_only(target, available, "pattern")
+    await send_available_only(target, available, "pattern", None)
     if target != interaction.channel:
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
@@ -307,7 +311,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador de disponibilidad (endpoint @me)")
+    return web.Response(text="Bot activo – verificador con endpoint oficial")
 
 async def start_web_server():
     app = web.Application()
