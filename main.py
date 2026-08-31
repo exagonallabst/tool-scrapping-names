@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificación de disponibilidad de nombres de usuario.
-Usa el endpoint público /users/username?username=... (sin autenticación).
-- 404 → nombre libre (disponible)
-- 200 → nombre ocupado (existe)
-- 429 → rate limit (espera y reintenta)
-- Otros → se considera ocupado por seguridad
-Variables: DISCORD_BOT_TOKEN (obligatorio), REQUEST_DELAY (opcional)
-El token de usuario solo se usa para validación inicial, no es necesario para la verificación.
+Discord bot – verificación de disponibilidad usando el endpoint oficial /users/@me/username
+Requiere token de usuario (DISCORD_USER_TOKEN) para autenticarse.
+Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
 """
 
 import os
@@ -26,13 +21,15 @@ from discord.ext import commands
 
 # ===== CONFIGURACIÓN =====
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
 
-if not DISCORD_BOT_TOKEN:
-    raise RuntimeError("Falta la variable de entorno DISCORD_BOT_TOKEN.")
+if not DISCORD_BOT_TOKEN or not DISCORD_USER_TOKEN:
+    raise RuntimeError("Faltan variables de entorno DISCORD_BOT_TOKEN y DISCORD_USER_TOKEN.")
 
-# Headers para el endpoint público (no necesita autenticación)
-PUBLIC_HEADERS = {
+USER_HEADERS = {
+    "Authorization": DISCORD_USER_TOKEN,
+    "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 API_BASE = "https://discord.com/api/v9"
@@ -57,32 +54,35 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON ENDPOINT PÚBLICO
+#  VERIFICADOR CON /users/@me/username
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Usa GET /users/username?username=... (público).
-    Retorna True si el nombre está disponible (404), False si ocupado (200) o error.
+    Usa GET /users/@me/username?username=... (requiere token de usuario).
+    Retorna True si available=true, False en cualquier otro caso.
     """
-    url = f"{API_BASE}/users/username?username={username}"
+    url = f"{API_BASE}/users/@me/username?username={username}"
     try:
-        async with session.get(url, headers=PUBLIC_HEADERS) as resp:
+        async with session.get(url, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
             print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
-            if status == 404:
-                print(f"  → ✅ DISPONIBLE (no existe)")
-                return True
-            elif status == 200:
-                print(f"  → ❌ OCUPADO (existe)")
-                return False
+            if status == 200:
+                data = json.loads(text)
+                available = data.get("available", False)
+                if available:
+                    print(f"  → ✅ DISPONIBLE")
+                else:
+                    print(f"  → ❌ OCUPADO (available=false)")
+                return available
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  ⏳ rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_available(session, username)
             else:
+                # 400 (formato inválido), 401/403 (token inválido), 500, etc.
                 print(f"  → ❌ ERROR (status {status}), tratado como ocupado")
                 return False
     except Exception as e:
@@ -118,8 +118,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Solo informativo: no necesita token de usuario para verificar.
-    print("✅ Usando endpoint público, no se requiere token de usuario.")
+    # Validar token de usuario
+    async with aiohttp.ClientSession() as session:
+        url = f"{API_BASE}/users/@me"
+        try:
+            async with session.get(url, headers=USER_HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
+                else:
+                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status})")
+        except Exception as e:
+            print(f"❌ Error al validar token: {e}")
 
 # ------------------------------------------------------------------
 #  ENVÍO DE REPORTE
@@ -296,7 +306,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador de disponibilidad (endpoint público)")
+    return web.Response(text="Bot activo – verificador con token de usuario")
 
 async def start_web_server():
     app = web.Application()
