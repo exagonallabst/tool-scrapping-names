@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificación de disponibilidad usando el endpoint oficial /users/@me/username
-Requiere token de usuario (DISCORD_USER_TOKEN) para autenticarse.
-Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY (opcional)
+Discord bot – verificador de disponibilidad definitivo.
+Endpoint prioritario: /users/@me/username (autenticado).
+Fallback a /users/username (público) si el primero falla por 401/403.
+Comandos: /check, /test, /numbers, /alnum, /words, /pattern.
+Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
 """
 
 import os
@@ -25,7 +27,7 @@ DISCORD_USER_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
 
 if not DISCORD_BOT_TOKEN or not DISCORD_USER_TOKEN:
-    raise RuntimeError("Faltan variables de entorno DISCORD_BOT_TOKEN y DISCORD_USER_TOKEN.")
+    raise RuntimeError("Faltan DISCORD_BOT_TOKEN y DISCORD_USER_TOKEN.")
 
 USER_HEADERS = {
     "Authorization": DISCORD_USER_TOKEN,
@@ -54,39 +56,74 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
     return [prefix + ''.join(random.choices(string.digits, k=num_len)) for _ in range(count)]
 
 # ------------------------------------------------------------------
-#  VERIFICADOR CON /users/@me/username
+#  VERIFICADOR CON ENDPOINT AUTENTICADO Y FALLBACK
 # ------------------------------------------------------------------
 
 async def check_username_available(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Usa GET /users/@me/username?username=... (requiere token de usuario).
-    Retorna True si available=true, False en cualquier otro caso.
+    Intenta primero el endpoint autenticado /users/@me/username.
+    Si da 401/403, usa fallback público /users/username.
+    Retorna True si disponible (404 en público, o available=true en autenticado).
     """
-    url = f"{API_BASE}/users/@me/username?username={username}"
+    # 1. Endpoint autenticado
+    url_auth = f"{API_BASE}/users/@me/username?username={username}"
     try:
-        async with session.get(url, headers=USER_HEADERS) as resp:
+        async with session.get(url_auth, headers=USER_HEADERS) as resp:
             status = resp.status
             text = await resp.text()
-            print(f"  GET {username} → status {status}, respuesta: {text[:200]}")
+            print(f"  [AUTH] GET {username} → status {status}, respuesta: {text[:200]}")
             if status == 200:
                 data = json.loads(text)
                 available = data.get("available", False)
                 if available:
-                    print(f"  → ✅ DISPONIBLE")
+                    print(f"  → ✅ DISPONIBLE (autenticado)")
                 else:
-                    print(f"  → ❌ OCUPADO (available=false)")
+                    print(f"  → ❌ OCUPADO (autenticado)")
                 return available
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  ⏳ rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_available(session, username)
+            elif status in (401, 403):
+                print(f"  ⚠️ Token inválido o sin permisos, usando fallback público...")
+                # Fallback público
+                return await check_username_public(session, username)
             else:
-                # 400 (formato inválido), 401/403 (token inválido), 500, etc.
+                # Otros errores: 400, 500, etc.
                 print(f"  → ❌ ERROR (status {status}), tratado como ocupado")
                 return False
     except Exception as e:
-        print(f"  → ❌ EXCEPCIÓN: {e}")
+        print(f"  → ❌ EXCEPCIÓN en autenticado: {e}")
+        return False
+
+async def check_username_public(session: aiohttp.ClientSession, username: str) -> bool:
+    """
+    Fallback público: GET /users/username?username=...
+    404 = disponible, 200 = ocupado.
+    """
+    url_pub = f"{API_BASE}/users/username?username={username}"
+    try:
+        async with session.get(url_pub, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+            status = resp.status
+            text = await resp.text()
+            print(f"  [PUBLIC] GET {username} → status {status}, respuesta: {text[:200]}")
+            if status == 404:
+                print(f"  → ✅ DISPONIBLE (público: no existe)")
+                return True
+            elif status == 200:
+                print(f"  → ❌ OCUPADO (público: existe)")
+                return False
+            elif status == 429:
+                retry = (await resp.json()).get("retry_after", 5)
+                print(f"  ⏳ rate limit público, esperando {retry}s")
+                await asyncio.sleep(retry + 1)
+                return await check_username_public(session, username)
+            else:
+                print(f"  → ❌ ERROR público (status {status}), tratado como ocupado")
+                return False
+    except Exception as e:
+        print(f"  → ❌ EXCEPCIÓN en público: {e}")
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
@@ -118,7 +155,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Validar token de usuario
+    # Validar token
     async with aiohttp.ClientSession() as session:
         url = f"{API_BASE}/users/@me"
         try:
@@ -127,7 +164,7 @@ async def on_ready():
                     data = await resp.json()
                     print(f"✅ TOKEN DE USUARIO VÁLIDO - Usuario: {data.get('username')}")
                 else:
-                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status})")
+                    print(f"❌ TOKEN DE USUARIO INVÁLIDO (status {resp.status}), se usará fallback público")
         except Exception as e:
             print(f"❌ Error al validar token: {e}")
 
@@ -162,6 +199,35 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     await channel.send(embed=embed, file=file)
 
 # ------------------------------------------------------------------
+#  COMANDO /test (depuración)
+# ------------------------------------------------------------------
+
+@bot.tree.command(name="test", description="Prueba un nombre y muestra la respuesta cruda")
+@app_commands.describe(username="Nombre a verificar")
+async def slash_test(interaction: discord.Interaction, username: str):
+    username = username.strip()
+    if len(username) < 2 or len(username) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', username):
+        await interaction.response.send_message("❌ Nombre inválido.")
+        return
+    async with aiohttp.ClientSession() as session:
+        # Probar autenticado
+        url_auth = f"{API_BASE}/users/@me/username?username={username}"
+        async with session.get(url_auth, headers=USER_HEADERS) as resp:
+            text_auth = await resp.text()
+            status_auth = resp.status
+        # Probar público
+        url_pub = f"{API_BASE}/users/username?username={username}"
+        async with session.get(url_pub, headers={"User-Agent": "Mozilla/5.0"}) as resp2:
+            text_pub = await resp2.text()
+            status_pub = resp2.status
+        await interaction.response.send_message(
+            f"**{username}**\n"
+            f"Autenticado: status {status_auth}, respuesta: {text_auth[:200]}\n"
+            f"Público: status {status_pub}, respuesta: {text_pub[:200]}\n\n"
+            f"Interpretación: disponible si autenticado dice 'available':true o público 404."
+        )
+
+# ------------------------------------------------------------------
 #  COMANDO /check
 # ------------------------------------------------------------------
 
@@ -189,7 +255,7 @@ async def slash_check(interaction: discord.Interaction, lista: str, channel: dis
         await interaction.followup.send(f"Reporte enviado a {target.mention}")
 
 # ------------------------------------------------------------------
-#  COMANDOS GENERADORES
+#  COMANDOS GENERADORES (numbers, alnum, words, pattern)
 # ------------------------------------------------------------------
 
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
@@ -306,7 +372,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verificador con token de usuario")
+    return web.Response(text="Bot activo – verificador con doble estrategia")
 
 async def start_web_server():
     app = web.Application()
@@ -316,10 +382,6 @@ async def start_web_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=8080)
     await site.start()
     print("Servidor web iniciado en puerto 8080")
-
-# ------------------------------------------------------------------
-#  EJECUCIÓN PRINCIPAL
-# ------------------------------------------------------------------
 
 async def main():
     asyncio.create_task(start_web_server())
