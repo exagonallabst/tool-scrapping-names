@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Discord bot – verificación de disponibilidad por existencia de usuario.
-Endpoint: GET /api/v9/users/username?username=...
-- 404 → nombre libre (disponible)
-- 200 → nombre ocupado
-- 429 → rate limit, espera y reintenta
-- Otros → se considera no disponible (por seguridad)
+Discord bot – verificación de disponibilidad de nombres de usuario.
+Comandos:
+  /numbers <count> <length> [channel]  – genera números y verifica
+  /alnum   <count> <length> [channel]  – genera alfanuméricos
+  /words   <file> <count> [channel]    – genera desde archivo
+  /pattern <prefix> <count> <num_len> [channel] – prefijo + dígitos
+  /check   <lista> [channel]           – verifica nombres específicos (separados por comas o espacios)
+
+El comando /check es el que necesitas: pasa los nombres que ves en el canal,
+por ejemplo: /check 25649,98331,6290,98684
+El bot verificará cada uno y te dará los disponibles en un archivo.
 Variables: DISCORD_BOT_TOKEN, DISCORD_USER_TOKEN, REQUEST_DELAY
 """
 
@@ -16,6 +21,7 @@ import random
 import string
 import io
 import json
+import re
 from typing import List, Optional
 
 import discord
@@ -62,12 +68,7 @@ def gen_pattern(prefix: str, count: int, num_len: int) -> List[str]:
 
 async def check_username_exists(session: aiohttp.ClientSession, username: str) -> bool:
     """
-    Retorna True si el nombre está disponible (no existe usuario con ese nombre).
-    Usa GET /users/username?username=... 
-    - 404 → libre
-    - 200 → ocupado
-    - 429 → reintentar
-    - otro → asumir ocupado (por seguridad)
+    Retorna True si el nombre está disponible (404), False si ocupado (200) o error.
     """
     url = f"{API_BASE}/users/username?username={username}"
     try:
@@ -76,26 +77,35 @@ async def check_username_exists(session: aiohttp.ClientSession, username: str) -
             text = await resp.text()
             print(f"  GET {username} → status {status}, respuesta: {text[:150]}")
             if status == 404:
-                return True   # no existe, disponible
+                return True   # disponible
             elif status == 200:
-                return False  # existe, ocupado
+                return False  # ocupado
             elif status == 429:
                 retry = (await resp.json()).get("retry_after", 5)
                 print(f"  rate limit, esperando {retry}s")
                 await asyncio.sleep(retry + 1)
                 return await check_username_exists(session, username)
             else:
-                # 401, 403, 500, etc. -> asumir ocupado
                 return False
     except Exception as e:
         print(f"  GET excepción: {e}")
         return False
 
 async def check_list(usernames: List[str], delay: float = REQUEST_DELAY) -> List[str]:
+    """
+    Verifica una lista de nombres y retorna los disponibles.
+    """
     available = []
     async with aiohttp.ClientSession() as session:
         total = len(usernames)
         for idx, name in enumerate(usernames, start=1):
+            name = name.strip()
+            if not name:
+                continue
+            # Validar que el nombre cumpla con los requisitos de Discord (2-32 caracteres, alfanumérico)
+            if len(name) < 2 or len(name) > 32 or not re.match(r'^[a-zA-Z0-9_]+$', name):
+                print(f"  {name} → nombre inválido (longitud o caracteres)")
+                continue
             print(f"[{idx}/{total}] Verificando: {name}")
             if await check_username_exists(session, name):
                 available.append(name)
@@ -114,7 +124,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot conectado como {bot.user}")
-    # Verificar token de usuario con GET /users/@me
+    # Validar token de usuario
     async with aiohttp.ClientSession() as session:
         url = f"{API_BASE}/users/@me"
         try:
@@ -158,7 +168,43 @@ async def send_available_only(channel: discord.TextChannel, available: List[str]
     await channel.send(embed=embed, file=file)
 
 # ------------------------------------------------------------------
-#  COMANDOS SLASH
+#  NUEVO COMANDO /check
+# ------------------------------------------------------------------
+
+@bot.tree.command(name="check", description="Verifica nombres específicos (separados por comas o espacios)")
+@app_commands.describe(
+    lista="Lista de nombres separados por comas, espacios o saltos de línea",
+    channel="Canal para el reporte (opcional)"
+)
+async def slash_check(interaction: discord.Interaction, lista: str, channel: discord.TextChannel = None):
+    # Limpiar la lista: separar por comas, espacios o saltos de línea
+    # Reemplazar comas y saltos de línea por espacios
+    cleaned = lista.replace(',', ' ').replace('\n', ' ').replace('\r', ' ')
+    # Dividir por espacios y filtrar vacíos
+    names = [n.strip() for n in cleaned.split() if n.strip()]
+    if not names:
+        await interaction.response.send_message("No se proporcionaron nombres válidos.")
+        return
+
+    # Limitar a 100 nombres para no sobrecargar
+    if len(names) > 100:
+        names = names[:100]
+        await interaction.response.send_message(f"Demasiados nombres, limitando a los primeros 100.")
+    else:
+        await interaction.response.send_message(f"Se recibieron {len(names)} nombres. Verificando... (puede tardar)")
+
+    # Verificar
+    available = await check_list(names)
+
+    # Reportar
+    target = channel or interaction.channel
+    await send_available_only(target, available, "check")
+    if target != interaction.channel:
+        await interaction.followup.send(f"Reporte enviado a {target.mention}")
+
+# ------------------------------------------------------------------
+#  COMANDOS EXISTENTES (numbers, alnum, words, pattern)
+#  (se mantienen igual, solo se añade el nuevo /check)
 # ------------------------------------------------------------------
 
 @bot.tree.command(name="numbers", description="Genera números y verifica disponibilidad")
@@ -275,7 +321,7 @@ async def slash_pattern(interaction: discord.Interaction, prefix: str, count: in
 from aiohttp import web
 
 async def handle(request):
-    return web.Response(text="Bot activo – verifica disponibilidad por existencia de usuario")
+    return web.Response(text="Bot activo – verifica disponibilidad (con comando /check)")
 
 async def start_web_server():
     app = web.Application()
